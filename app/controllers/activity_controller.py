@@ -9,6 +9,7 @@ from app.repositories.activity_repository import ActivityRepository
 from app.schemas.activity import (
     ActivityCompletionEligibilityResponse,
     ActivityCreateRequest,
+    ActivityPlannedResourceResponse,
     ActivityResourceSchema,
     ActivityResponse,
     ActivityUpdateRequest,
@@ -48,6 +49,16 @@ class ActivityController:
             ActivityResourceSchema.model_validate(resource_row)
             if resource_row else None
         )
+        # Per-activity planned-resource allocations (the stored planned info).
+        # The rate + cost are resolved live on the FINANCE page (which carries the
+        # caller bearer for the leave-mgmt rate call); the plain activity response
+        # returns the allocation, so ``monthlyRate``/``computedCost`` stay null here.
+        resp.resources = [
+            ActivityPlannedResourceResponse(
+                designation=pr.designation, quantity=pr.quantity, duration=pr.duration,
+            )
+            for pr in self.repo.list_planned_resources(row.id)
+        ]
         # Multipart-arm /create may attach a freshly-created Comment row
         # on ``_inline_comment`` — surface as ``data.comment``.
         inline = getattr(row, "_inline_comment", None)
