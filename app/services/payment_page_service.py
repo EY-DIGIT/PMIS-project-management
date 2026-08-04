@@ -38,7 +38,6 @@ from app.repositories.project_phase_cf_allocation_repository import (
 from app.repositories.project_phase_qrg_repository import ProjectPhaseQrgRepository
 from app.repositories.project_repository import ProjectRepository
 from app.clients.contract_management_client import ContractManagementClient
-from app.clients.leave_designation_rates_client import LeaveDesignationRatesClient
 from app.schemas.payment import (
     CarryForwardAllocationResponse,
     CarryForwardResponse,
@@ -54,7 +53,7 @@ from app.schemas.payment import (
     PhaseBlock,
     SlaLdDeductionBlock,
 )
-from app.utilities import catalogs, cf_pool, cycle_calc, payment_calc, resource_rate
+from app.utilities import catalogs, cf_pool, cycle_calc, payment_calc
 from app.utilities.payment_lock import assert_payment_writable, is_payment_locked
 from app.utilities.payment_masters import validate_frequency_code
 
@@ -291,9 +290,7 @@ class PaymentPageService:
         # its milestones' activities' planned-resource allocations (leave-mgmt rate
         # × qty × duration), in-memory (no DB write), so totals + phase base reflect
         # it. Returns the per-activity resource cost for the partial-payment breakup.
-        resource_cost_by_activity = self._apply_resource_costs(
-            project, cost_rows, ms_map, bearer_token,
-        )
+        resource_cost_by_activity = self._apply_resource_costs(cost_rows, ms_map)
 
         # Saved custom-split shares, grouped by carrying phase (for round-trip).
         alloc_resp_by_phase: dict = {}
@@ -721,7 +718,7 @@ class PaymentPageService:
         pct_overrides = _last_phase_percent_overrides(ordered, all_terms)
         # Live per-activity resource cost across all partial milestones' activities.
         all_partial_acts = [a for acts in activities_by_ms.values() for a in acts]
-        cost_by_activity = self._cost_by_activity(_project, all_partial_acts, bearer_token)
+        cost_by_activity = self._cost_by_activity(all_partial_acts)
         out: List[PaymentTermResponse] = []
         for t in term_rows:
             override = pct_overrides.get(t.id)
@@ -1229,7 +1226,7 @@ class PaymentPageService:
                 [term.milestone_id]).get(term.milestone_id, [])
             ms_position = self.milestones.position_by_ids(
                 [term.milestone_id]).get(term.milestone_id)
-            cost_by_activity = self._cost_by_activity(_project, ms_acts, bearer_token)
+            cost_by_activity = self._cost_by_activity(ms_acts)
             resp.activities = _build_term_activities(
                 effective_total, ms_acts, self.term_activities.list_for_term(term_id),
                 override if override is not None else term.percent_of_payment, ms_position,
@@ -1242,12 +1239,11 @@ class PaymentPageService:
                 ))
         return resp
 
-    def _cost_by_activity(self, project, activities, bearer_token):
-        """``{activity_id: resource_cost}`` for ``activities`` — Σ (rate × qty ×
-        duration) over each activity's planned-resource allocations, with the
-        monthly rate resolved LIVE from leave-mgmt (per project+org, cached per
-        org; year picked from the activity's contract quarter). Activities without
-        allocations are omitted; leave-mgmt down / no card → rate 0."""
+    def _cost_by_activity(self, activities):
+        """``{activity_id: resource_cost}`` for ``activities`` — Σ the SNAPSHOTTED
+        ``computed_cost`` over each activity's planned-resource allocations (the
+        rate + cost were resolved from the Java service and stored at write time;
+        no live call here). Activities without allocations are omitted."""
         if not activities:
             return {}
         alloc_rows = self.activities.list_planned_resources_for_activities(
@@ -1255,37 +1251,16 @@ class PaymentPageService:
         )
         if not alloc_rows:
             return {}
-        allocs_by_act: dict = {}
-        for r in alloc_rows:
-            allocs_by_act.setdefault(r.activity_id, []).append(r)
-
-        client = LeaveDesignationRatesClient()
-        cards_by_org: dict = {}
-
-        def cards_for(org):
-            if org not in cards_by_org:
-                cards_by_org[org] = resource_rate.cards_by_role(
-                    client.fetch_designation_rates(project.id, org, bearer_token)
-                )
-            return cards_by_org[org]
-
         out: dict = {}
-        for a in activities:
-            rows = allocs_by_act.get(a.id)
-            if not rows:
-                continue
-            cards = cards_for(a.vendor_id)
-            year_no = resource_rate.contract_year_no(a.start_date, project.start_date)
-            total = Decimal("0")
-            for r in rows:
-                rate = resource_rate.rate_for_year(cards.get(r.designation), year_no)
-                total += resource_rate.row_cost(rate, r.quantity, r.duration)
-            out[a.id] = payment_calc.to_2dp(total)
-        return out
+        for r in alloc_rows:
+            out[r.activity_id] = out.get(r.activity_id, Decimal("0")) + (
+                r.computed_cost or Decimal("0")
+            )
+        return {aid: payment_calc.to_2dp(v) for aid, v in out.items()}
 
-    def _apply_resource_costs(self, project, cost_rows, ms_map, bearer_token):
-        """Set each ``resource_cost`` cost item's ``cost`` LIVE from its
-        milestones' activities' planned-resource allocations, and return
+    def _apply_resource_costs(self, cost_rows, ms_map):
+        """Set each ``resource_cost`` cost item's ``cost`` from its milestones'
+        activities' SNAPSHOTTED planned-resource costs, and return
         ``{activity_id: resource_cost}`` for the partial-payment breakup.
 
         The cost is set on the (detached) ORM rows in-memory so the payment math
@@ -1299,7 +1274,7 @@ class PaymentPageService:
         res_ms_ids = sorted({m for c in resource_ci for m in ms_map.get(c.id, [])})
         acts_by_ms = self.activities.list_by_milestone_ids(res_ms_ids)
         all_acts = [a for acts in acts_by_ms.values() for a in acts]
-        cost_by_activity = self._cost_by_activity(project, all_acts, bearer_token)
+        cost_by_activity = self._cost_by_activity(all_acts)
         for c in resource_ci:
             ci_total = sum(
                 (cost_by_activity.get(a.id, Decimal("0"))

@@ -4,12 +4,13 @@ A **resource-based** activity (one under a milestone with ``is_resource_based``)
 carries a 1:many set of allocation rows: how many of a given ``designation`` are
 deployed on it, and for how long (``duration``, in months). Designation NAMES and
 their per-contract-year rates live in the Java leave-management module
-(``/api/designation-rates``) — only the ALLOCATION (designation + quantity +
-duration) is stored here; the monthly rate is resolved LIVE at compute time and is
-NOT persisted. The row's cost = ``quantity × liveMonthlyRate × duration``; an
-activity's resource cost is the sum of its rows, which surfaces on the finance page
-as the activity's value in a resource-based (partial-payment) milestone's
-activity-wise breakup.
+(``/api/designation-rates``). At create/edit time the monthly rate is resolved from
+that service (for the activity's contract year) and **snapshotted** here alongside
+the derived ``computed_cost`` = ``quantity × monthly_rate × duration``, so reads
+and the finance page never call the Java service and a later master-rate change
+does not restate saved allocations. An activity's resource cost is the sum of its
+rows, which surfaces on the finance page as the activity's value in a resource-based
+(partial-payment) milestone's activity-wise breakup.
 
 ``designation`` is the free-text ``role`` string as returned by the Java service
 (NOT an FK). ``duration`` is a flat number of months in ``[0, 3]`` (an activity
@@ -62,6 +63,12 @@ class ActivityPlannedResource(Base):
     quantity: Mapped[int] = mapped_column(Integer, default=1)
     # Flat number of months in [0, 3] (2dp) — no deployment dates.
     duration: Mapped[Decimal] = mapped_column(Numeric(4, 2))
+    # SNAPSHOT of the monthly rate resolved from the Java designation-rates service
+    # at create/edit time (for the activity's contract year), and the derived cost
+    # = quantity × monthly_rate × duration. Stored so reads + finance never call the
+    # Java service; a later master-rate change does not restate saved allocations.
+    monthly_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))
+    computed_cost: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
 
     position: Mapped[int] = mapped_column(Integer, default=0)
 

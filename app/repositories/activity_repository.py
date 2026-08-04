@@ -247,7 +247,10 @@ class ActivityRepository:
             self.db.add(ActivityPlannedResource(
                 activity_id=activity_id, project_id=project_id,
                 designation=r["designation"], quantity=r["quantity"],
-                duration=r["duration"], position=pos,
+                duration=r["duration"],
+                monthly_rate=r.get("monthly_rate"),
+                computed_cost=r.get("computed_cost"),
+                position=pos,
                 created_by=actor_user_id, updated_by=actor_user_id,
             ))
         self.db.flush()

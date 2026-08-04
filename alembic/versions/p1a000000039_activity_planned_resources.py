@@ -9,9 +9,10 @@ Why:
   off a resource_cost cost item, priced from a client rate card by fractional
   months) ONTO the activity. Each resource-based activity gets a 1:many set of
   allocation rows ``{ designation, quantity, duration }`` (duration a flat number
-  of months in [0,3]); the monthly rate is resolved LIVE from the Java
-  designation-rates service, so nothing rate/cost is stored here. Create
-  ``activity_planned_resources`` and drop the obsolete ``planned_resources``.
+  of months in [0,3]); the monthly rate is resolved from the Java designation-rates
+  service AT WRITE TIME and snapshotted here (`monthly_rate`, `computed_cost`), so
+  reads + finance never call it. Create ``activity_planned_resources`` and drop the
+  obsolete ``planned_resources``.
 """
 from __future__ import annotations
 
@@ -34,6 +35,9 @@ def upgrade() -> None:
         sa.Column("designation", sa.String(255), nullable=False),
         sa.Column("quantity", sa.Integer(), nullable=False, server_default=sa.text("1")),
         sa.Column("duration", sa.Numeric(4, 2), nullable=False),
+        # Snapshots resolved from the Java designation-rates service at write time.
+        sa.Column("monthly_rate", sa.Numeric(12, 2), nullable=True),
+        sa.Column("computed_cost", sa.Numeric(18, 2), nullable=True),
         sa.Column("position", sa.Integer(), nullable=False, server_default=sa.text("0")),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),

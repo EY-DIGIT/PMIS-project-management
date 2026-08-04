@@ -63,12 +63,33 @@ _CATEGORY_CCN = "ccn"
 _VALID_CATEGORIES = (_CATEGORY_ORIGINAL, _CATEGORY_ASG, _CATEGORY_CCN)
 
 
-def _resource_rows(items) -> list:
-    """Map ``ActivityPlannedResourceItem[]`` → dicts for the repo replace."""
-    return [
-        {"designation": i.designation, "quantity": i.quantity, "duration": i.duration}
-        for i in (items or [])
-    ]
+def _snapshot_resource_rows(project, activity_start, vendor_id, items, bearer_token):
+    """Map ``ActivityPlannedResourceItem[]`` → repo dicts, resolving each row's
+    monthly rate from the Java designation-rates service (for the activity's
+    contract year, per project+org) and SNAPSHOTTING rate + cost. Leave-mgmt
+    down / no card → rate 0 (cost 0)."""
+    items = list(items or [])
+    if not items:
+        return []
+    from app.clients.leave_designation_rates_client import LeaveDesignationRatesClient
+    from app.utilities import resource_rate
+    cards = resource_rate.cards_by_role(
+        LeaveDesignationRatesClient().fetch_designation_rates(
+            getattr(project, "id", None), vendor_id, bearer_token,
+        )
+    )
+    year_no = resource_rate.contract_year_no(
+        activity_start, getattr(project, "start_date", None),
+    )
+    out = []
+    for i in items:
+        rate = resource_rate.rate_for_year(cards.get(i.designation), year_no)
+        cost = resource_rate.row_cost(rate, i.quantity, i.duration)
+        out.append({
+            "designation": i.designation, "quantity": i.quantity, "duration": i.duration,
+            "monthly_rate": rate, "computed_cost": cost,
+        })
+    return out
 
 
 class ActivityService:
@@ -103,6 +124,7 @@ class ActivityService:
         caller_user_id: Optional[str],
         body: Optional[str] = None,
         attachments: Optional[List[dict]] = None,
+        bearer_token: Optional[str] = None,
     ):
         milestone = self.milestones.get_by_id(milestone_id)
         if milestone is None:
@@ -198,8 +220,12 @@ class ActivityService:
 
         if payload.resources:
             self._assert_resource_based(milestone)
+            project = self.projects.get_by_id(milestone.project_id)
             self.repo.replace_planned_resources(
-                row.id, row.project_id, _resource_rows(payload.resources),
+                row.id, row.project_id,
+                _snapshot_resource_rows(
+                    project, row.start_date, row.vendor_id, payload.resources, bearer_token,
+                ),
                 actor_user_id=caller_user_id,
             )
 
@@ -345,6 +371,7 @@ class ActivityService:
     def update(  # NOSONAR(S3776): sequential validation gates with order-sensitive side effects (validate -> mutate -> audit -> commit -> depends_on cycle-check) -- refactor deferred to a sprint with FE regression coverage
         self, activity_id: str, payload: ActivityUpdateRequest,
         *, caller_user_id: Optional[str], request=None,
+        bearer_token: Optional[str] = None,
     ):
         row = self.get_by_id(activity_id)
         updates = payload.model_dump(exclude_unset=True)
@@ -473,8 +500,12 @@ class ActivityService:
         if payload.resources is not None:
             milestone = self.milestones.get_by_id(row.milestone_id)
             self._assert_resource_based(milestone)
+            project = self.projects.get_by_id(row.project_id)
             self.repo.replace_planned_resources(
-                row.id, row.project_id, _resource_rows(payload.resources),
+                row.id, row.project_id,
+                _snapshot_resource_rows(
+                    project, row.start_date, row.vendor_id, payload.resources, bearer_token,
+                ),
                 actor_user_id=caller_user_id,
             )
             self.audit.write(
