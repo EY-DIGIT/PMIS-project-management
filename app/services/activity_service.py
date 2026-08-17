@@ -46,7 +46,10 @@ from app.utilities.catalogs import (
     is_known_priority,
     is_terminal_status,
 )
-from app.utilities.date_rules import validate_entity_dates
+from app.utilities.date_rules import (
+    _to_ist_calendar_midnight,
+    validate_entity_dates,
+)
 from app.utilities.multipart_form import (
     pre_validate_files,
     upload_files_via_client,
@@ -65,9 +68,12 @@ _VALID_CATEGORIES = (_CATEGORY_ORIGINAL, _CATEGORY_ASG, _CATEGORY_CCN)
 
 def _snapshot_resource_rows(project, activity_start, vendor_id, items, bearer_token):
     """Map ``ActivityPlannedResourceItem[]`` → repo dicts, resolving each row's
-    monthly rate from the Java designation-rates service (for the activity's
-    contract year, per project+org) and SNAPSHOTTING rate + cost. Leave-mgmt
-    down / no card → rate 0 (cost 0)."""
+    monthly rate from the Java designation-rates service and SNAPSHOTTING rate +
+    cost. The contract year is resolved PER ROW from that row's
+    ``planned_deployment_date`` (anchored on the project start) — so an allocation
+    that deploys in a later contract year is priced at that year's card, not the
+    project-start year. Falls back to the activity start only if a row somehow
+    lacks a deployment date. Leave-mgmt down / no card → rate 0 (cost 0)."""
     items = list(items or [])
     if not items:
         return []
@@ -78,11 +84,12 @@ def _snapshot_resource_rows(project, activity_start, vendor_id, items, bearer_to
             getattr(project, "id", None), vendor_id, bearer_token,
         )
     )
-    year_no = resource_rate.contract_year_no(
-        activity_start, getattr(project, "start_date", None),
-    )
+    project_start = getattr(project, "start_date", None)
     out = []
     for i in items:
+        year_no = resource_rate.contract_year_no(
+            i.planned_deployment_date or activity_start, project_start,
+        )
         rate = resource_rate.rate_for_year(cards.get(i.designation), year_no)
         cost = resource_rate.row_cost(rate, i.quantity, i.duration)
         out.append({
@@ -221,6 +228,7 @@ class ActivityService:
 
         if payload.resources:
             self._assert_resource_based(milestone)
+            self._assert_deployment_dates_within_window(row, payload.resources)
             project = self.projects.get_by_id(milestone.project_id)
             self.repo.replace_planned_resources(
                 row.id, row.project_id,
@@ -501,6 +509,7 @@ class ActivityService:
         if payload.resources is not None:
             milestone = self.milestones.get_by_id(row.milestone_id)
             self._assert_resource_based(milestone)
+            self._assert_deployment_dates_within_window(row, payload.resources)
             project = self.projects.get_by_id(row.project_id)
             self.repo.replace_planned_resources(
                 row.id, row.project_id,
@@ -532,6 +541,38 @@ class ActivityService:
                 "Planned resources can only be set on activities under a "
                 "resource-based milestone."
             )
+
+    def _assert_deployment_dates_within_window(self, activity, items) -> None:
+        """Every allocation's planned deployment date must fall inside the
+        activity's own [start_date, end_date] window (inclusive).
+
+        Compared on the IST calendar so a ``date`` (the allocation's
+        ``planned_deployment_date``) and the activity's tz-aware ``datetime``
+        bounds line up cleanly (``end_date`` is stored end-of-day, so its IST
+        date is the last valid day). Skipped when the activity has no window.
+        """
+        start_m = _to_ist_calendar_midnight(getattr(activity, "start_date", None))
+        end_m = _to_ist_calendar_midnight(getattr(activity, "end_date", None))
+        if start_m is None or end_m is None:
+            return
+        start_d, end_d = start_m.date(), end_m.date()
+        for i in items or []:
+            deploy = getattr(i, "planned_deployment_date", None)
+            if deploy is None:
+                continue
+            if deploy < start_d or deploy > end_d:
+                raise ValidationError(
+                    f"Planned deployment date {deploy.isoformat()} for "
+                    f"'{i.designation}' is outside the activity window "
+                    f"{start_d.isoformat()} to {end_d.isoformat()}.",
+                    details={
+                        "errorIdentifier": "deployment_date_outside_activity_window",
+                        "designation": i.designation,
+                        "plannedDeploymentDate": deploy.isoformat(),
+                        "windowStart": start_d.isoformat(),
+                        "windowEnd": end_d.isoformat(),
+                    },
+                )
 
     def delete(self, activity_id: str, *, caller_user_id: Optional[str]):
         row = self.get_by_id(activity_id)
